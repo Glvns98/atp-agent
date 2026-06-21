@@ -27,7 +27,7 @@ client.intercept_all() # All outgoing requests are now guarded by ATP
 If you do not write Python, but need to audit AI agents or view live cryptographic telemetry streams, you can run the Enterprise Portal from any machine:
 
 ```bash
-npx @atp/portal
+npx atp-portal
 ```
 This will launch the Sahara Dark Theme UI on `localhost:5173`. You can securely authenticate with your Tenant API Key to monitor your agents globally, or use the Independent Auditor Portal without logging in to drop and verify `.md` Compliance Certificates.
 
