@@ -1,0 +1,708 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/elazarl/goproxy"
+	"github.com/gorilla/websocket"
+	"gopkg.in/yaml.v2"
+)
+
+// Policy and API Models
+type Capability struct {
+	Scope         string  `yaml:"scope" json:"scope"`
+	MaxAmount     float64 `yaml:"max_amount" json:"max_amount"`
+	EscalateAbove float64 `yaml:"escalate_above" json:"escalate_above"`
+	Reversible    bool    `yaml:"reversible" json:"reversible"`
+	Granted       *bool   `yaml:"granted" json:"granted"`
+}
+
+type AgentConfig struct {
+	Role         string       `yaml:"role" json:"role"`
+	Capabilities []Capability `yaml:"capabilities" json:"capabilities"`
+	Default      string       `yaml:"default" json:"default"`
+}
+
+type DLPConfig struct {
+	MaxPayloadBytes int      `yaml:"max_payload_bytes" json:"max_payload_bytes"`
+	BlockedKeywords []string `yaml:"blocked_keywords" json:"blocked_keywords"`
+}
+
+type PolicyConfig struct {
+	Enforcement map[string]string      `yaml:"enforcement" json:"enforcement"`
+	Agents      map[string]AgentConfig `yaml:"agents" json:"agents"`
+	Roles       map[string]interface{} `yaml:"roles" json:"roles"`
+	DLP         DLPConfig              `yaml:"dlp" json:"dlp"`
+}
+
+type EscalationTask struct {
+	ID        string  `json:"id"`
+	State     string  `json:"state"` // PENDING, ALLOW, BLOCK
+	AgentID   string  `json:"agent_id"`
+	Action    string  `json:"action"`
+	Amount    float64 `json:"amount"`
+	Timestamp string  `json:"timestamp"`
+	
+	// ATP specific
+	Req       *http.Request `json:"-"`
+	BodyBytes []byte        `json:"-"`
+	WaitChan  chan bool     `json:"-"`
+}
+
+type EscalationResolveReq struct {
+	EscalationID string `json:"escalation_id"`
+	Decision     string `json:"decision"` // ALLOW or BLOCK
+}
+
+// Circuit Breaker (Phase 5)
+type CircuitBreaker struct {
+	State        string
+	TripTime     time.Time
+	RequestCount int
+	WindowStart  time.Time
+}
+
+// Telemetry Event Model
+type TelemetryEvent struct {
+	Timestamp    string                 `json:"timestamp"`
+	AgentID      string                 `json:"agent_id"`
+	Action       string                 `json:"action"`
+	Arguments    map[string]interface{} `json:"arguments"`
+	Status       string                 `json:"status"`
+	Reason       string                 `json:"reason,omitempty"`
+	EscalationID string                 `json:"escalation_id,omitempty"`
+	Proof        string                 `json:"proof,omitempty"`
+	PrevHash     string                 `json:"prev_hash,omitempty"`
+}
+
+var (
+	ctx             = context.Background()
+	dlpConfig       DLPConfig
+	agentConfigMap  = make(map[string]AgentConfig)
+	policyLock      sync.RWMutex
+	
+	escalations     = make(map[string]*EscalationTask) 
+	escalationsLock sync.RWMutex
+
+	// Taint Tracking (Phase 3)
+	taintMap  = make(map[string]time.Time)
+	taintLock sync.RWMutex
+
+	breakerMap  = make(map[string]*CircuitBreaker)
+	breakerLock sync.RWMutex
+
+	// In-memory velocity tracking
+	agentDailySpent = make(map[string]float64)
+	agentDailyLock  sync.RWMutex
+
+	// WebSocket clients
+	clients   = make(map[*websocket.Conn]bool)
+	broadcast = make(chan TelemetryEvent, 100)
+	upgrader  = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	
+	telemetryFile *os.File
+
+	// Phase 7: Control Plane variables
+	globalKillSwitchActive bool
+	globalKillSwitchLock   sync.RWMutex
+	suspendedAgents        = make(map[string]string)
+	suspendedAgentsLock    sync.RWMutex
+)
+
+func generateID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+func loadPolicies() {
+	data, err := os.ReadFile("policy.yaml")
+	if err != nil {
+		log.Fatalf("Failed to read policy.yaml: %v", err)
+	}
+	var config PolicyConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		log.Fatalf("Failed to parse policy.yaml: %v", err)
+	}
+	
+	policyLock.Lock()
+	defer policyLock.Unlock()
+	dlpConfig = config.DLP
+	agentConfigMap = config.Agents
+	log.Println("RBAC Policies loaded successfully.")
+}
+
+func initTelemetry() {
+	// Initialize lastHash from existing file
+	lastHash := "0000000000000000000000000000000000000000000000000000000000000000"
+	fileBytes, err := os.ReadFile("telemetry.jsonl")
+	if err == nil && len(fileBytes) > 0 {
+		lines := bytes.Split(bytes.TrimSpace(fileBytes), []byte("\n"))
+		if len(lines) > 0 {
+			// Find the last non-empty line
+			for i := len(lines) - 1; i >= 0; i-- {
+				if len(lines[i]) > 0 {
+					hashBytes := sha256.Sum256(lines[i])
+					lastHash = hex.EncodeToString(hashBytes[:])
+					break
+				}
+			}
+		}
+	}
+
+	var openErr error
+	telemetryFile, openErr = os.OpenFile("telemetry.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if openErr != nil {
+		log.Fatalf("Failed to open telemetry file: %v", openErr)
+	}
+
+	go func() {
+		for {
+			event := <-broadcast
+			event.PrevHash = lastHash
+			eventJSON, _ := json.Marshal(event)
+
+			// Update hash for next event
+			hashBytes := sha256.Sum256(eventJSON)
+			lastHash = hex.EncodeToString(hashBytes[:])
+
+			telemetryFile.WriteString(string(eventJSON) + "\n")
+			for client := range clients {
+				err := client.WriteJSON(event)
+				if err != nil {
+					client.Close()
+					delete(clients, client)
+				}
+			}
+		}
+	}()
+}
+
+func recordEvent(agentID, action, status, reason, escID, proof string, args map[string]interface{}) {
+	event := TelemetryEvent{
+		Timestamp:    time.Now().Format(time.RFC3339Nano),
+		AgentID:      agentID,
+		Action:       action,
+		Arguments:    args,
+		Status:       status,
+		Reason:       reason,
+		EscalationID: escID,
+		Proof:        proof,
+	}
+	select {
+	case broadcast <- event:
+	default:
+		log.Println("Warning: Broadcast channel full")
+	}
+}
+
+func sendJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+// REST Control Plane Handlers
+func escalationPendingHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	escalationsLock.RLock()
+	var pending []EscalationTask
+	for _, task := range escalations {
+		if task.State == "PENDING" {
+			pending = append(pending, *task)
+		}
+	}
+	escalationsLock.RUnlock()
+	sendJSON(w, map[string]interface{}{"pending": pending})
+}
+
+func escalationResolveHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+	var req EscalationResolveReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	escalationsLock.Lock()
+	task, exists := escalations[req.EscalationID]
+	if exists && task.State == "PENDING" {
+		task.State = req.Decision
+		if req.Decision == "ALLOW" {
+			agentDailyLock.Lock()
+			agentDailySpent[task.AgentID] += task.Amount
+			agentDailyLock.Unlock()
+		}
+		// Unblock the proxy thread
+		task.WaitChan <- true
+	}
+	escalationsLock.Unlock()
+
+	if exists {
+		recordEvent("human", "resolve_escalation", req.Decision, "", req.EscalationID, "", map[string]interface{}{"target_agent": task.AgentID, "amount": task.Amount})
+	}
+	sendJSON(w, map[string]string{"status": "OK"})
+}
+
+func telemetryHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	file, err := os.Open("telemetry.jsonl")
+	if err != nil {
+		sendJSON(w, map[string]interface{}{"events": []TelemetryEvent{}})
+		return
+	}
+	defer file.Close()
+	var events []TelemetryEvent
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var evt TelemetryEvent
+		if err := json.Unmarshal(scanner.Bytes(), &evt); err == nil {
+			events = append(events, evt)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error scanning telemetry file: %v", err)
+	}
+	if len(events) > 200 {
+		events = events[len(events)-200:]
+	}
+	sendJSON(w, map[string]interface{}{"events": events})
+}
+
+func policiesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodGet {
+		policyLock.RLock()
+		defer policyLock.RUnlock()
+		sendJSON(w, agentConfigMap)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var config PolicyConfig
+		if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		data, _ := yaml.Marshal(&config)
+		os.WriteFile("policy.yaml", data, 0644)
+
+		policyLock.Lock()
+		dlpConfig = config.DLP
+		agentConfigMap = config.Agents
+		policyLock.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil { return }
+	clients[ws] = true
+	go func() {
+		defer func() { ws.Close(); delete(clients, ws) }()
+		for { if _, _, err := ws.ReadMessage(); err != nil { break } }
+	}()
+}
+
+// Phase 7: Kill Switch Handler
+func killswitchHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions { return }
+
+	globalKillSwitchLock.Lock()
+	defer globalKillSwitchLock.Unlock()
+
+	if r.Method == http.MethodPost {
+		var req map[string]bool
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if active, ok := req["active"]; ok {
+				globalKillSwitchActive = active
+				status := "Deactivated"
+				if active { status = "Activated" }
+				recordEvent("system", "kill_switch", "ALLOW", fmt.Sprintf("Global Kill Switch %s", status), "", "", nil)
+			}
+		}
+	}
+	sendJSON(w, map[string]bool{"active": globalKillSwitchActive})
+}
+
+// Phase 6: Audit Chain Verifier Handler
+func auditVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	if r.Method == http.MethodOptions { return }
+
+	fileBytes, err := os.ReadFile("telemetry.jsonl")
+	if err != nil {
+		sendJSON(w, map[string]interface{}{"status": "error", "message": "Failed to read telemetry"})
+		return
+	}
+
+	lines := bytes.Split(bytes.TrimSpace(fileBytes), []byte("\n"))
+	expectedHash := "0000000000000000000000000000000000000000000000000000000000000000"
+
+	for i, line := range lines {
+		if len(line) == 0 { continue }
+		var event TelemetryEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			sendJSON(w, map[string]interface{}{"status": "corrupt", "line": i + 1, "message": "Malformed JSON"})
+			return
+		}
+		if event.PrevHash != expectedHash {
+			sendJSON(w, map[string]interface{}{"status": "corrupt", "line": i + 1, "message": fmt.Sprintf("Hash mismatch. Expected: %s, Found: %s", expectedHash, event.PrevHash)})
+			return
+		}
+		hashBytes := sha256.Sum256(line)
+		expectedHash = hex.EncodeToString(hashBytes[:])
+	}
+	sendJSON(w, map[string]interface{}{"status": "valid", "message": "Chain is fully intact"})
+}
+
+// ATP MITM PROXY Logic
+var (
+	coralPubKey  ed25519.PublicKey
+	coralPrivKey ed25519.PrivateKey
+)
+
+func init() {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	coralPubKey = pub
+	coralPrivKey = priv
+}
+
+func generateCORALSignature(agentID, canonicalReq, decisionID, evaluator, parentReqID string) string {
+	timestamp := time.Now().UnixNano()
+	data := fmt.Sprintf("policy_version:v2.0|decision_id:%s|evaluator:%s|parent_request_id:%s|agent_id:%s|canonical_req:%s|timestamp:%d", decisionID, evaluator, parentReqID, agentID, canonicalReq, timestamp)
+	hash := sha256.Sum256([]byte(data))
+	
+	// Phase 9: CORAL Cryptographic Audit Signature (Ed25519)
+	sig := ed25519.Sign(coralPrivKey, hash[:])
+	
+	return "CORAL-ED25519-" + hex.EncodeToString(sig)[:32]
+}
+
+type atpLogger struct{}
+
+func (l *atpLogger) Printf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	// Catch standard Go TLS library warnings and goproxy MITM errors
+	if strings.Contains(strings.ToLower(msg), "remote error: tls") || strings.Contains(strings.ToLower(msg), "certificate signed by unknown authority") || strings.Contains(strings.ToLower(msg), "tls: bad certificate") {
+		recordEvent("anonymous-agent", "tls_handshake", "WARN", "Potential certificate pinning bypass attempt: "+msg, "", "", nil)
+	}
+	log.Printf(format, v...)
+}
+
+func startProxy() {
+	// Expose Root CA for Python SDK
+	certPath := "atp-rootCA.pem"
+	if _, err := os.Stat("/app/certs"); !os.IsNotExist(err) {
+		certPath = "/app/certs/atp-rootCA.pem"
+	}
+	os.WriteFile(certPath, goproxy.CA_CERT, 0644)
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = true // Required to intercept the TLS MITM warnings
+	proxy.Logger = &atpLogger{}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+
+	proxy.OnRequest().DoFunc(
+		func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			// Bypass localhost control plane
+			if r.URL.Host == "localhost:8081" || r.URL.Host == "127.0.0.1:8081" {
+				return r, nil
+			}
+
+			agentID := r.Header.Get("X-ATP-Agent-ID")
+			if agentID == "" {
+				agentID = "anonymous-agent"
+			}
+
+			// Phase 7: Global Kill Switch Check
+			globalKillSwitchLock.RLock()
+			if globalKillSwitchActive {
+				globalKillSwitchLock.RUnlock()
+				recordEvent(agentID, "kill_switch", "BLOCK", "Global Kill Switch is ACTIVE", "", "", nil)
+				return r, goproxy.NewResponse(r, "application/json", 503, `{"error":"ATP: Global Kill Switch is ACTIVE"}`)
+			}
+			globalKillSwitchLock.RUnlock()
+
+			// Capture payload
+			var bodyBytes []byte
+			if r.Body != nil {
+				bodyBytes, _ = io.ReadAll(r.Body)
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
+
+			// Parse dummy action for testing. If body has {"amount": X}, it's a "refund".
+			// In production, policy routes on URL and payloads.
+			action := r.URL.Host
+			var amount float64
+			var args map[string]interface{}
+			if len(bodyBytes) > 0 {
+				json.Unmarshal(bodyBytes, &args)
+				if val, ok := args["amount"]; ok {
+					action = "refund"
+					amount, _ = val.(float64)
+				}
+			}
+
+			policyLock.RLock()
+			localDLP := dlpConfig
+			policyLock.RUnlock()
+
+			// 1. Enforce Max Payload Bytes
+			if localDLP.MaxPayloadBytes > 0 && len(bodyBytes) > localDLP.MaxPayloadBytes {
+				recordEvent(agentID, action, "BLOCK", "Payload exceeds max allowed bytes", "", "", args)
+				return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Payload Too Large"}`)
+			}
+			
+			// 2. Enforce Keyword DLP
+			upperBody := bytes.ToUpper(bodyBytes)
+			for _, keyword := range localDLP.BlockedKeywords {
+				if bytes.Contains(upperBody, bytes.ToUpper([]byte(keyword))) {
+					reason := fmt.Sprintf("DLP Violation: Matched forbidden keyword '%s'", keyword)
+					recordEvent(agentID, action, "BLOCK", reason, "", "", args)
+					return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: DLP Violation"}`)
+				}
+			}
+			// 3. Schema Enforcement (Phase 6)
+			if len(bodyBytes) > 0 {
+				var rawMap map[string]interface{}
+				if err := json.Unmarshal(bodyBytes, &rawMap); err != nil {
+					recordEvent(agentID, action, "BLOCK", "Schema Violation: Malformed JSON payload", "", "", nil)
+					return r, goproxy.NewResponse(r, "application/json", 400, `{"error":"ATP: Malformed JSON"}`)
+				}
+				for k := range rawMap {
+					if k != "action" && k != "amount" && k != "asset" {
+						recordEvent(agentID, action, "BLOCK", fmt.Sprintf("Schema Violation: Undocumented field '%s'", k), "", "", args)
+						return r, goproxy.NewResponse(r, "application/json", 400, fmt.Sprintf(`{"error":"ATP: Schema Violation - Invalid field '%s'"}`, k))
+					}
+				}
+			}
+			// Parse action scope for capability matching
+			scope := "payments:refund" // default
+			if actionRaw, ok := args["action"].(string); ok {
+				scope = "payments:" + actionRaw
+				action = actionRaw
+			}
+
+			// Circuit Breaker / Anomaly Detection (Phase 5)
+			breakerLock.Lock()
+			cb, exists := breakerMap[agentID]
+			if !exists {
+				cb = &CircuitBreaker{State: "CLOSED", WindowStart: time.Now()}
+				breakerMap[agentID] = cb
+			}
+			
+			// 10 second rolling window
+			if time.Since(cb.WindowStart) > 10*time.Second {
+				cb.RequestCount = 0
+				cb.WindowStart = time.Now()
+			}
+			cb.RequestCount++
+
+			if cb.State == "OPEN" {
+				if time.Since(cb.TripTime) > 60*time.Second {
+					cb.State = "HALF_OPEN"
+				} else {
+					breakerLock.Unlock()
+					recordEvent(agentID, scope, "BLOCK", "Circuit Breaker OPEN (Suspended)", "", "", args)
+					return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Circuit Breaker OPEN"}`)
+				}
+			}
+
+			// Anomaly: > 5 requests in 10 seconds
+			if cb.RequestCount > 5 && cb.State == "CLOSED" {
+				cb.State = "OPEN"
+				cb.TripTime = time.Now()
+				breakerLock.Unlock()
+				recordEvent(agentID, scope, "BLOCK", "Anomaly Detected: Velocity Spike. Circuit Breaker tripped.", "", "", args)
+				return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Anomaly Detected"}`)
+			}
+			breakerLock.Unlock()
+
+			// Evaluate Policy (RBAC Default Deny)
+			policyLock.RLock()
+			agentCfg, agentExists := agentConfigMap[agentID]
+			policyLock.RUnlock()
+
+			if !agentExists {
+				recordEvent(agentID, scope, "BLOCK", "Agent identity not registered (Default Deny)", "", "", args)
+				return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Agent Not Registered"}`)
+			}
+
+			var matchedCap *Capability
+			for _, cap := range agentCfg.Capabilities {
+				if cap.Scope == scope {
+					if cap.Granted != nil && !*cap.Granted {
+						break // Explicit deny
+					}
+					// Copy capability since cap is loop variable
+					c := cap
+					matchedCap = &c
+					break
+				}
+			}
+
+			if matchedCap == nil {
+				recordEvent(agentID, scope, "BLOCK", "Capability not granted in role (Default Deny)", "", "", args)
+				return r, goproxy.NewResponse(r, "application/json", 403, fmt.Sprintf(`{"error":"ATP: Capability %s Not Granted"}`, scope))
+			}
+
+			// Taint tracking capability downgrade
+			taintLock.RLock()
+			taintTime, isTainted := taintMap[agentID]
+			taintLock.RUnlock()
+			isRecentlyTainted := isTainted && time.Since(taintTime) < 5*time.Minute
+
+			// Enforce capability constraints
+			if amount > 0 || !matchedCap.Reversible {
+				agentDailyLock.RLock()
+				spentToday := agentDailySpent[agentID]
+				agentDailyLock.RUnlock()
+
+				isVelocityViolation := (spentToday+amount) > 1000.0 // Fallback daily limit
+				isAmountViolation := matchedCap.MaxAmount > 0 && amount > matchedCap.MaxAmount
+				isEscalation := (matchedCap.EscalateAbove > 0 && amount > matchedCap.EscalateAbove) || isRecentlyTainted || !matchedCap.Reversible
+
+				if isVelocityViolation {
+					recordEvent(agentID, action, "BLOCK", "Velocity Limit Reached", "", "", args)
+					return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Velocity Limit Reached"}`)
+				} else if isAmountViolation {
+					recordEvent(agentID, action, "BLOCK", "Exceeds max_amount", "", "", args)
+					return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Hard Limit Exceeded"}`)
+				} else if isEscalation {
+					// HITL
+					escID := generateID()
+					task := &EscalationTask{
+						ID: escID, State: "PENDING", AgentID: agentID, Action: action, Amount: amount,
+						Timestamp: time.Now().Format(time.RFC3339Nano), Req: r, BodyBytes: bodyBytes,
+						WaitChan: make(chan bool),
+					}
+					
+					escalationsLock.Lock()
+					escalations[escID] = task
+					escalationsLock.Unlock()
+
+					reason := "Awaiting human approval"
+					if isRecentlyTainted {
+						reason = "Taint-based capability downgrade (recently ingested untrusted data)"
+					} else if !matchedCap.Reversible {
+						reason = "Action is irreversible (forced HITL)"
+					}
+					recordEvent(agentID, action, "ESCALATE", reason, escID, "", args)
+
+					// Freeze thread
+					select {
+					case <-task.WaitChan:
+					case <-time.After(30 * time.Second):
+						task.State = "BLOCK"
+						recordEvent(agentID, action, "BLOCK", "Escalation timed out", escID, "", args)
+						return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Escalation Timed Out"}`)
+					}
+
+					if task.State == "BLOCK" {
+						recordEvent(agentID, action, "BLOCK", "Human denied request", escID, "", args)
+						return r, goproxy.NewResponse(r, "application/json", 403, `{"error":"ATP: Human Denied"}`)
+					}
+					// If ALLOW, proceed
+				} else {
+					agentDailyLock.Lock()
+					agentDailySpent[agentID] += amount
+					agentDailyLock.Unlock()
+				}
+			}
+
+			// Canonical Attestation (Method + URL + Body)
+			canonicalReq := r.Method + r.URL.String() + string(bodyBytes)
+			parentReqID := r.Header.Get("X-ATP-Parent-Request-ID")
+			decisionID := generateID()
+			signature := generateCORALSignature(agentID, canonicalReq, decisionID, "rbac", parentReqID)
+			r.Header.Set("X-ATP-Proof", signature)
+			r.Header.Set("X-ATP-Timestamp", time.Now().UTC().Format(time.RFC3339))
+			
+			recordEvent(agentID, action, "ALLOW", "", "", signature, args)
+			return r, nil
+		})
+
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		if resp == nil || ctx.Req == nil {
+			return resp
+		}
+		if ctx.Req.URL.Host == "localhost:8081" || ctx.Req.URL.Host == "127.0.0.1:8081" {
+			return resp
+		}
+		agentID := ctx.Req.Header.Get("X-ATP-Agent-ID")
+		if agentID == "" {
+			return resp
+		}
+
+		// Inject Trust Label
+		resp.Header.Set("X-ATP-Trust-Label", "external_untrusted")
+
+		// Mark agent as tainted
+		taintLock.Lock()
+		taintMap[agentID] = time.Now()
+		taintLock.Unlock()
+
+		recordEvent(agentID, "ingest_data", "WARN", "Ingested untrusted external data", "", "", map[string]interface{}{"source": ctx.Req.URL.String()})
+		return resp
+	})
+
+	log.Println("ATP Layer 7 Proxy listening on :8080")
+	http.ListenAndServe(":8080", proxy)
+}
+
+func main() {
+	loadPolicies()
+	initTelemetry()
+
+	// Start proxy on 8080
+	go startProxy()
+
+	// Start control plane on 8081
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/telemetry", telemetryHandler)
+	mux.HandleFunc("/v1/escalation/pending", escalationPendingHandler)
+	mux.HandleFunc("/v1/escalation/resolve", escalationResolveHandler)
+	mux.HandleFunc("/v1/policies", policiesHandler)
+	mux.HandleFunc("/v1/stream", streamHandler)
+	mux.HandleFunc("/v1/killswitch", killswitchHandler)
+	mux.HandleFunc("/v1/audit/verify", auditVerifyHandler)
+
+	log.Println("Enterprise Control Plane listening on :8081")
+	if err := http.ListenAndServe(":8081", mux); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}

@@ -1,3 +1,3 @@
-module github.com/Glvns98/atp-agent/sdk/go
+module github.com/atp-standard/sdk/go
 
 go 1.20

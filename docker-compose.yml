@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  engine:
+    build: 
+      context: .
+      dockerfile: engine.Dockerfile
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    networks:
+      - outbound-net
+      - proxy-net
+    volumes:
+      - ./engine/policy.yaml:/app/policy.yaml
+      - ./telemetry.jsonl:/app/telemetry.jsonl
+      - certs-vol:/app/certs
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent.Dockerfile
+    depends_on:
+      - engine
+    environment:
+      - HTTP_PROXY=http://engine:8080
+      - HTTPS_PROXY=http://engine:8080
+      - ATP_PROXY_URL=http://engine:8080
+      - REQUESTS_CA_BUNDLE=/certs/atp-rootCA.pem
+    networks:
+      # PHASE 1 ENFORCEMENT:
+      # The agent is completely isolated on an internal network.
+      # It has NO route to the internet. If the engine dies, egress dies.
+      - proxy-net
+    volumes:
+      - ./tests:/app/tests
+      - ./sdk:/app/sdk
+      - certs-vol:/certs
+    command: tail -f /dev/null # Keep alive for executing tests
+
+networks:
+  outbound-net:
+    driver: bridge
+  proxy-net:
+    internal: true # Enforces fail-closed isolation
+
+volumes:
+  certs-vol:

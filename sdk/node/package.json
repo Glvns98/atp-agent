@@ -1,0 +1,8 @@
+{
+  "name": "atp-agent",
+  "version": "2.0.0",
+  "description": "ATP Node.js SDK",
+  "main": "index.js",
+  "author": "donglvns",
+  "license": "MIT"
+}

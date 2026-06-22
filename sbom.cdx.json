@@ -1,0 +1,27 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-06-22T12:50:28Z",
+    "component": {
+      "type": "application",
+      "name": "ATP Gateway",
+      "version": "2.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "requests",
+      "version": "2.31.0",
+      "purl": "pkg:pypi/requests@2.31.0"
+    },
+    {
+      "type": "library",
+      "name": "urllib3",
+      "version": "2.1.0",
+      "purl": "pkg:pypi/urllib3@2.1.0"
+    }
+  ]
+}

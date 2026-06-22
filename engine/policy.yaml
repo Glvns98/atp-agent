@@ -1,0 +1,46 @@
+# engine/policy.yaml v2
+enforcement:
+  mode: fail_closed
+  network_isolation: namespace
+
+agents:
+  bot-omega:
+    role: refund_processor
+    capabilities:
+      - scope: "payments:refund"
+        max_amount: 500
+        escalate_above: 300
+        reversible: true
+      - scope: "payments:transfer"
+        granted: false
+      - scope: "database:delete"
+        max_amount: 0
+        escalate_above: 0
+        reversible: false
+    default: deny
+
+roles:
+  refund_processor:
+    inherits: []
+    description: "Customer support refund automation, no transfer/deploy access"
+
+dlp:
+  max_payload_bytes: 512000
+  blocked_keywords:
+    - "CONFIDENTIAL"
+    - "API_KEY"
+    - "PRIVATE_KEY"
+
+supply_chain:
+  enforce_hash_pinning: true
+  block_on_unverified_signature: false
+  sbom_path: "./sbom.cdx.json"
+
+# ---------------------------------------------------------
+# ENTERPRISE COMPLIANCE (Inactive in Community Edition)
+# ---------------------------------------------------------
+# To generate official SOC2/MiCA PDF Audit Reports,
+# sync your cryptographic proofs to the ATP Global Ledger.
+# 
+# cloud_sync: false
+# tenant_api_key: ""

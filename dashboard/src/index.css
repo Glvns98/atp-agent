@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #1A1512;
+  --color-card: #241E1A;
+  --color-primary: #D19E5B;
+  --color-success: #7C9070;
+  --color-warning: #D19E5B;
+  --color-danger: #B85C47;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-background);
+    color: #f3f4f6;
+    font-family: 'Product Sans', 'DM Sans', 'Inter', system-ui, sans-serif;
+  }
+}
+
+/* Custom scrollbar for glassmorphism panels */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.1);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
